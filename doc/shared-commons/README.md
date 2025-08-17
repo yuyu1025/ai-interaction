@@ -13,10 +13,11 @@
 - 配置相关实体
 
 ### 2. 工具类
-- JSON/XML/Protobuf序列化工具
+- Protobuf序列化工具
 - 加密/解密工具
 - 时间处理工具
 - 网络工具
+- MyBatis-Plus工具类
 
 ### 3. 常量与配置
 - 系统常量定义
@@ -480,6 +481,96 @@ public class ValidationUtils {
 }
 ```
 
+## MyBatis-Plus基础类
+
+### 通用基础实体
+```java
+@Data
+public abstract class BaseEntity {
+    
+    @TableField(value = "create_time", fill = FieldFill.INSERT)
+    private LocalDateTime createTime;
+    
+    @TableField(value = "update_time", fill = FieldFill.INSERT_UPDATE)
+    private LocalDateTime updateTime;
+    
+    @TableLogic
+    @TableField("deleted")
+    private Boolean deleted;
+}
+```
+
+### 自动填充处理器
+```java
+@Component
+public class MyMetaObjectHandler implements MetaObjectHandler {
+    
+    @Override
+    public void insertFill(MetaObject metaObject) {
+        this.strictInsertFill(metaObject, "createTime", LocalDateTime.class, LocalDateTime.now());
+        this.strictInsertFill(metaObject, "updateTime", LocalDateTime.class, LocalDateTime.now());
+        this.strictInsertFill(metaObject, "deleted", Boolean.class, false);
+    }
+    
+    @Override
+    public void updateFill(MetaObject metaObject) {
+        this.strictUpdateFill(metaObject, "updateTime", LocalDateTime.class, LocalDateTime.now());
+    }
+}
+```
+
+### JSON类型处理器
+```java
+@Component
+public class JsonTypeHandler<T> extends BaseTypeHandler<T> {
+    
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final Class<T> type;
+    
+    public JsonTypeHandler(Class<T> type) {
+        this.type = type;
+    }
+    
+    @Override
+    public void setNonNullParameter(PreparedStatement ps, int i, T parameter, JdbcType jdbcType) throws SQLException {
+        try {
+            ps.setString(i, objectMapper.writeValueAsString(parameter));
+        } catch (JsonProcessingException e) {
+            throw new SQLException("Failed to serialize object to JSON", e);
+        }
+    }
+    
+    @Override
+    public T getNullableResult(ResultSet rs, String columnName) throws SQLException {
+        String json = rs.getString(columnName);
+        return parseJson(json);
+    }
+    
+    @Override
+    public T getNullableResult(ResultSet rs, int columnIndex) throws SQLException {
+        String json = rs.getString(columnIndex);
+        return parseJson(json);
+    }
+    
+    @Override
+    public T getNullableResult(CallableStatement cs, int columnIndex) throws SQLException {
+        String json = cs.getString(columnIndex);
+        return parseJson(json);
+    }
+    
+    private T parseJson(String json) {
+        if (json == null || json.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(json, type);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to deserialize JSON to object", e);
+        }
+    }
+}
+```
+
 ## Maven配置
 
 ```xml
@@ -490,6 +581,12 @@ public class ValidationUtils {
     <packaging>jar</packaging>
     
     <dependencies>
+        <!-- MyBatis-Plus -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-boot-starter</artifactId>
+        </dependency>
+        
         <!-- JSON处理 -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
@@ -498,6 +595,12 @@ public class ValidationUtils {
         <dependency>
             <groupId>com.fasterxml.jackson.datatype</groupId>
             <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+        
+        <!-- Protocol Buffers -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
         </dependency>
         
         <!-- 数据验证 -->

@@ -34,12 +34,12 @@
 
 ### 技术栈选型
 ```
-- Spring Boot + Data JPA (应用框架)
-- Redis Cluster (状态存储)
+- Spring Boot + WebFlux (应用框架)
+- MyBatis-Plus (数据访问层，支持软删除)
+- Redis (状态缓存)
 - PostgreSQL (持久化存储)
-- Apache Kafka (事件流)
-- Consul (服务发现)
-- Micrometer (监控指标)
+- Spring Events (内部事件)
+- Spring Boot Actuator (监控指标)
 ```
 
 ### 架构设计
@@ -82,7 +82,7 @@
 public class SessionRepository {
     
     private final RedisTemplate<String, SessionState> redisTemplate;
-    private final SessionJpaRepository jpaRepository;
+    private final SessionMapper sessionMapper;
     
     public Mono<SessionState> findBySessionId(String sessionId) {
         // 优先从Redis缓存读取
@@ -91,8 +91,11 @@ public class SessionRepository {
             .cast(SessionState.class)
             .switchIfEmpty(
                 // 缓存未命中，从数据库读取并缓存
-                Mono.fromCallable(() -> jpaRepository.findBySessionId(sessionId))
+                Mono.fromCallable(() -> sessionMapper.selectBySessionId(sessionId))
                     .flatMap(sessionEntity -> {
+                        if (sessionEntity == null) {
+                            return Mono.empty();
+                        }
                         SessionState state = convertToSessionState(sessionEntity);
                         return cacheSessionState(sessionId, state)
                             .thenReturn(state);
@@ -106,8 +109,14 @@ public class SessionRepository {
             redisTemplate.opsForValue()
                 .set("session:" + sessionState.getSessionId(), sessionState, Duration.ofHours(24)),
             // 异步保存到数据库
-            Mono.fromRunnable(() -> 
-                jpaRepository.save(convertToSessionEntity(sessionState)))
+            Mono.fromRunnable(() -> {
+                SessionEntity entity = convertToSessionEntity(sessionState);
+                if (sessionMapper.selectBySessionId(sessionState.getSessionId()) == null) {
+                    sessionMapper.insert(entity);
+                } else {
+                    sessionMapper.updateById(entity);
+                }
+            })
         ).then();
     }
 }
@@ -205,38 +214,40 @@ public class ResourceAllocator {
 
 ### 状态定义
 ```java
-@Entity
-@Table(name = "sessions")
-public class SessionEntity {
+@Data
+@TableName("sessions")
+public class SessionEntity extends BaseEntity {
     
-    @Id
+    @TableId(type = IdType.INPUT)
     private String sessionId;
     
-    @Column(nullable = false)
+    @TableField("user_id")
     private String userId;
     
-    @Enumerated(EnumType.STRING)
     private SessionStatus status;
     
-    @Column(name = "created_at")
-    private Instant createdAt;
+    @TableField("created_at")
+    private LocalDateTime createdAt;
     
-    @Column(name = "last_activity_at") 
-    private Instant lastActivityAt;
+    @TableField("last_activity_at") 
+    private LocalDateTime lastActivityAt;
     
-    @Column(name = "terminated_at")
-    private Instant terminatedAt;
+    @TableField("terminated_at")
+    private LocalDateTime terminatedAt;
     
-    @Enumerated(EnumType.STRING)
+    @TableField("termination_reason")
     private TerminationReason terminationReason;
     
-    @Type(type = "jsonb")
-    @Column(columnDefinition = "jsonb")
+    @TableField(typeHandler = JsonTypeHandler.class)
     private SessionConfiguration configuration;
     
-    @Type(type = "jsonb")
-    @Column(columnDefinition = "jsonb")
+    @TableField(typeHandler = JsonTypeHandler.class)
     private ResourceAllocation resourceAllocation;
+    
+    // MyBatis-Plus 软删除支持
+    @TableLogic
+    @TableField("deleted")
+    private Boolean deleted;
 }
 
 public enum SessionStatus {
@@ -504,6 +515,50 @@ public interface SessionEventListener {
 }
 ```
 
+### MyBatis-Plus Mapper
+```java
+@Mapper
+public interface SessionMapper extends BaseMapper<SessionEntity> {
+    
+    // 自定义查询方法
+    SessionEntity selectBySessionId(@Param("sessionId") String sessionId);
+    
+    List<SessionEntity> selectIdleSessionsBefore(@Param("cutoffTime") LocalDateTime cutoffTime);
+    
+    List<SessionEntity> selectSessionsWithoutHeartbeatSince(@Param("cutoffTime") LocalDateTime cutoffTime);
+    
+    int updateLastActivity(@Param("sessionId") String sessionId, @Param("lastActivity") LocalDateTime lastActivity);
+    
+    BigDecimal getAverageSessionDuration(@Param("startTime") LocalDateTime startTime, @Param("endTime") LocalDateTime endTime);
+}
+```
+
+### Mapper XML 配置
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<mapper namespace="com.ai.interaction.session.mapper.SessionMapper">
+    
+    <select id="selectBySessionId" resultType="com.ai.interaction.session.entity.SessionEntity">
+        SELECT * FROM sessions 
+        WHERE session_id = #{sessionId} AND deleted = 0
+    </select>
+    
+    <select id="selectIdleSessionsBefore" resultType="com.ai.interaction.session.entity.SessionEntity">
+        SELECT * FROM sessions 
+        WHERE status = 'IDLE' 
+        AND last_activity_at &lt; #{cutoffTime}
+        AND deleted = 0
+    </select>
+    
+    <update id="updateLastActivity">
+        UPDATE sessions 
+        SET last_activity_at = #{lastActivity}
+        WHERE session_id = #{sessionId} AND deleted = 0
+    </update>
+    
+</mapper>
+```
+
 ## 数据库设计
 
 ### 表结构
@@ -513,16 +568,21 @@ CREATE TABLE sessions (
     session_id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(64) NOT NULL,
     status VARCHAR(32) NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    last_activity_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    terminated_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP NOT NULL,
+    last_activity_at TIMESTAMP NOT NULL,
+    terminated_at TIMESTAMP,
     termination_reason VARCHAR(32),
     configuration JSONB,
     resource_allocation JSONB,
-    INDEX idx_user_id (user_id),
-    INDEX idx_status (status),
-    INDEX idx_last_activity (last_activity_at)
+    deleted BOOLEAN DEFAULT FALSE,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
+
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_status ON sessions(status);
+CREATE INDEX idx_sessions_last_activity ON sessions(last_activity_at);
+CREATE INDEX idx_sessions_deleted ON sessions(deleted);
 
 -- 会话事件表
 CREATE TABLE session_events (
@@ -530,11 +590,14 @@ CREATE TABLE session_events (
     session_id VARCHAR(64) NOT NULL,
     event_type VARCHAR(64) NOT NULL,
     event_data JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    INDEX idx_session_id (session_id),
-    INDEX idx_event_type (event_type),
-    INDEX idx_created_at (created_at)
+    deleted BOOLEAN DEFAULT FALSE,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
+
+CREATE INDEX idx_session_events_session_id ON session_events(session_id);
+CREATE INDEX idx_session_events_event_type ON session_events(event_type);
+CREATE INDEX idx_session_events_create_time ON session_events(create_time);
 ```
 
 ## 部署方案
